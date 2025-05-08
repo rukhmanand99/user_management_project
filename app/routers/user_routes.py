@@ -19,26 +19,34 @@ Key Highlights:
 """
 
 from builtins import dict, int, len, str
-from datetime import timedelta
+from datetime import timedelta, datetime
 from uuid import UUID
-from fastapi import APIRouter, Depends, HTTPException, Response, status, Request
+from typing import Optional
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.dependencies import get_current_user, get_db, get_email_service, require_role
 from app.schemas.pagination_schema import EnhancedPagination
 from app.schemas.token_schema import TokenResponse
-from app.schemas.user_schemas import LoginRequest, UserBase, UserCreate, UserListResponse, UserResponse, UserUpdate
-from app.services.user_service import UserService
+from app.schemas.user_schemas import UserCreate, UserListResponse, UserResponse, UserUpdate
 from app.services.jwt_service import create_access_token
+from app.services.user_service import UserService
+from app.services.email_service import EmailService
 from app.utils.link_generation import create_user_links, generate_pagination_links
 from app.dependencies import get_settings
-from app.services.email_service import EmailService
+
 router = APIRouter()
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 settings = get_settings()
 @router.get("/users/{user_id}", response_model=UserResponse, name="get_user", tags=["User Management Requires (Admin or Manager Roles)"])
-async def get_user(user_id: UUID, request: Request, db: AsyncSession = Depends(get_db), token: str = Depends(oauth2_scheme), current_user: dict = Depends(require_role(["ADMIN", "MANAGER"]))):
-    """
+async def get_user(
+    user_id: UUID,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(oauth2_scheme),
+    current_user: dict = Depends(require_role(["ADMIN", "MANAGER"])),
+):
+    """"
     Endpoint to fetch a user by their unique identifier (UUID).
 
     Utilizes the UserService to query the database asynchronously for the user and constructs a response
@@ -71,21 +79,54 @@ async def get_user(user_id: UUID, request: Request, db: AsyncSession = Depends(g
         links=create_user_links(user.id, request)  
     )
 
-# Additional endpoints for update, delete, create, and list users follow a similar pattern, using
-# asynchronous database operations, handling security with OAuth2PasswordBearer, and enhancing response
-# models with dynamic HATEOAS links.
+@router.get("/users/filter", response_model=UserListResponse, tags=["User Management Requires (Admin or Manager Roles)"])
+async def filter_users(
+    nickname: Optional[str] = Query(None, description="Filter by nickname"),
+    email: Optional[str] = Query(None, description="Filter by email"),
+    role: Optional[str] = Query(None, description="Filter by user role"),
+    is_locked: Optional[bool] = Query(None, description="Filter by locked status"),
+    start_date: Optional[datetime] = Query(None, description="Filter by start of creation date range"),
+    end_date: Optional[datetime] = Query(None, description="Filter by end of creation date range"),
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(require_role(["ADMIN", "MANAGER"])),
+):
+    """
+    Filter users based on various criteria like nickname, email, role, etc.
+    """
+    if start_date and end_date and start_date > end_date:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Start date cannot be greater than end date.",
+        )
 
-# This approach not only ensures that the API is secure and efficient but also promotes a better client
-# experience by adhering to REST principles and providing self-discoverable operations.
+    filters = {
+        "nickname": nickname,
+        "email": email,
+        "role": role,
+        "is_locked": is_locked,
+        "created_at__gte": start_date,
+        "created_at__lte": end_date,
+    }
 
+    users = await UserService.filter_users(db, {k: v for k, v in filters.items() if v is not None})
+    user_responses = [UserResponse.model_validate(user) for user in users]
+
+    return UserListResponse(
+        items=user_responses,
+        total=len(users),
+        page=1,  # For simplicity, pagination logic can be added later
+        size=len(users),
+        links=[],  # Add dynamic links if required
+    )
 @router.put("/users/{user_id}", response_model=UserResponse, name="update_user", tags=["User Management Requires (Admin or Manager Roles)"])
-async def update_user(user_id: UUID, user_update: UserUpdate, request: Request, db: AsyncSession = Depends(get_db), token: str = Depends(oauth2_scheme), current_user: dict = Depends(require_role(["ADMIN", "MANAGER"]))):
-    """
-    Update user information.
-
-    - **user_id**: UUID of the user to update.
-    - **user_update**: UserUpdate model with updated user information.
-    """
+async def update_user(
+    user_id: UUID,
+    user_update: UserUpdate,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(oauth2_scheme),
+    current_user: dict = Depends(require_role(["ADMIN", "MANAGER"])),
+):
     user_data = user_update.model_dump(exclude_unset=True)
     updated_user = await UserService.update(db, user_id, user_data)
     if not updated_user:
@@ -106,17 +147,16 @@ async def update_user(user_id: UUID, user_update: UserUpdate, request: Request, 
         created_at=updated_user.created_at,
         updated_at=updated_user.updated_at,
         links=create_user_links(updated_user.id, request),
-        is_prefessional=updated_user.is_professional
     )
 
 
 @router.delete("/users/{user_id}", status_code=status.HTTP_204_NO_CONTENT, name="delete_user", tags=["User Management Requires (Admin or Manager Roles)"])
-async def delete_user(user_id: UUID, db: AsyncSession = Depends(get_db), token: str = Depends(oauth2_scheme), current_user: dict = Depends(require_role(["ADMIN", "MANAGER"]))):
-    """
-    Delete a user by their ID.
-
-    - **user_id**: UUID of the user to delete.
-    """
+async def delete_user(
+    user_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(oauth2_scheme),
+    current_user: dict = Depends(require_role(["ADMIN", "MANAGER"])),
+):
     success = await UserService.delete(db, user_id)
     if not success:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
@@ -125,22 +165,14 @@ async def delete_user(user_id: UUID, db: AsyncSession = Depends(get_db), token: 
 
 
 @router.post("/users/", response_model=UserResponse, status_code=status.HTTP_201_CREATED, tags=["User Management Requires (Admin or Manager Roles)"], name="create_user")
-async def create_user(user: UserCreate, request: Request, db: AsyncSession = Depends(get_db), email_service: EmailService = Depends(get_email_service), token: str = Depends(oauth2_scheme), current_user: dict = Depends(require_role(["ADMIN", "MANAGER"]))):
-    """
-    Create a new user.
-
-    This endpoint creates a new user with the provided information. If the email
-    already exists, it returns a 400 error. On successful creation, it returns the
-    newly created user's information along with links to related actions.
-
-    Parameters:
-    - user (UserCreate): The user information to create.
-    - request (Request): The request object.
-    - db (AsyncSession): The database session.
-
-    Returns:
-    - UserResponse: The newly created user's information along with navigation links.
-    """
+async def create_user(
+    user: UserCreate,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    email_service: EmailService = Depends(get_email_service),
+    token: str = Depends(oauth2_scheme),
+    current_user: dict = Depends(require_role(["ADMIN", "MANAGER"])),
+):
     existing_user = await UserService.get_by_email(db, user.email)
     if existing_user:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Email already exists")
@@ -177,10 +209,8 @@ async def list_users(
     total_users = await UserService.count(db)
     users = await UserService.list_users(db, skip, limit)
 
-    user_responses = [
-        UserResponse.model_validate(user) for user in users
-    ]
-    
+    user_responses = [UserResponse.model_validate(user) for user in users]
+
     pagination_links = generate_pagination_links(request, skip, limit, total_users)
     
     # Construct the final response with pagination details
@@ -189,7 +219,7 @@ async def list_users(
         total=total_users,
         page=skip // limit + 1,
         size=len(user_responses),
-        links=pagination_links  # Ensure you have appropriate logic to create these links
+        links=pagination_links  
     )
 
 
