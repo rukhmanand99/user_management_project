@@ -180,7 +180,7 @@ class UserService:
         query = select(func.count()).select_from(User)
         result = await session.execute(query)
 
-        return result.scaler()
+        return result.scalar()
     
     @classmethod
     async def unlock_user_account(cls, session: AsyncSession, user_id: UUID) -> bool:
